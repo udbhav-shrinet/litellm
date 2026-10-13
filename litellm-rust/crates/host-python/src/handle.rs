@@ -1,7 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::panic_to_pyerr;
-use pyo3::exceptions::{PyBaseException, PyRuntimeError};
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError};
 use pyo3::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 
@@ -15,6 +15,11 @@ pub enum Suspension {
     /// and the execution stays suspended until the stream asks for a chunk.
     Open(Py<PyAny>),
     Yield(Py<PyAny>),
+}
+
+enum Resume {
+    Send(Py<PyAny>),
+    Throw(PyErr),
 }
 
 pub enum ExecutionStep {
@@ -72,31 +77,37 @@ impl Execution {
         }
     }
 
-    fn advance(
-        slf: &Bound<'_, Self>,
-        py: Python<'_>,
-        result: Option<PyResult<Py<PyAny>>>,
-    ) -> PyResult<Py<PyAny>> {
-        let mut body = {
+    fn advance(slf: &Bound<'_, Self>, py: Python<'_>, input: Resume) -> PyResult<Py<PyAny>> {
+        let (mut body, started) = {
             let mut execution = slf.borrow_mut();
-            match (&execution.state, result.is_some()) {
-                (ExecutionState::Created(_), false) | (ExecutionState::Suspended(_), true) => {}
+            let started = match (&execution.state, &input) {
+                (ExecutionState::Created(_), Resume::Send(value)) if value.is_none(py) => false,
+                (ExecutionState::Created(_), Resume::Send(_)) => {
+                    return Err(PyTypeError::new_err(
+                        "can't send non-None value to a just-started execution",
+                    ));
+                }
+                (ExecutionState::Suspended(_), _) => true,
                 (ExecutionState::Running, _) => {
                     return Err(PyRuntimeError::new_err("execution is already running"));
                 }
                 (ExecutionState::Closed, _) => {
                     return Err(PyRuntimeError::new_err("execution is closed"));
                 }
-                _ => {
+                (ExecutionState::Created(_), Resume::Throw(_)) => {
                     return Err(PyRuntimeError::new_err(
                         "execution requires start before resume and can only start once",
                     ));
                 }
-            }
+            };
             match std::mem::replace(&mut execution.state, ExecutionState::Running) {
-                ExecutionState::Created(body) | ExecutionState::Suspended(body) => body,
+                ExecutionState::Created(body) | ExecutionState::Suspended(body) => (body, started),
                 _ => unreachable!(),
             }
+        };
+        let result = match input {
+            Resume::Send(value) => started.then_some(Ok(value)),
+            Resume::Throw(error) => Some(Err(error)),
         };
         let lifecycle = slf.borrow().lifecycle;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -136,24 +147,16 @@ impl Execution {
 
 #[pymethods]
 impl Execution {
-    fn start(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Self::advance(slf, py, None)
+    fn send(slf: &Bound<'_, Self>, py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        Self::advance(slf, py, Resume::Send(value))
     }
 
-    fn resume_value(
-        slf: &Bound<'_, Self>,
-        py: Python<'_>,
-        value: Py<PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        Self::advance(slf, py, Some(Ok(value)))
-    }
-
-    fn resume_error(
+    fn throw(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         error: Bound<'_, PyBaseException>,
     ) -> PyResult<Py<PyAny>> {
-        Self::advance(slf, py, Some(Err(PyErr::from_value(error.into_any()))))
+        Self::advance(slf, py, Resume::Throw(PyErr::from_value(error.into_any())))
     }
 
     fn close(slf: &Bound<'_, Self>) {
