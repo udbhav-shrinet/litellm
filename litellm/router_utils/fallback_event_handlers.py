@@ -29,7 +29,12 @@ from litellm.router_utils.cooldown_handlers import (
 from litellm.router_utils.router_callbacks.track_deployment_metrics import (
     increment_deployment_failures_for_current_minute,
 )
-from litellm.types.router import LiteLLMParamsTypedDict, reject_server_owned_wif_params
+from litellm.types.router import (
+    FallbackSkipReason,
+    LiteLLMParamsTypedDict,
+    SkippedFallbackTarget,
+    reject_server_owned_wif_params,
+)
 
 if TYPE_CHECKING:
     from litellm.router import Router as _Router
@@ -202,12 +207,21 @@ class AttemptedFallbackTargets:
     """
 
     keys: frozenset[str] = frozenset()
+    skipped: tuple[SkippedFallbackTarget, ...] = ()
 
     def __contains__(self, key: str) -> bool:
         return key in self.keys
 
     def record(self, key: str) -> None:
         self.keys = self.keys | frozenset((key,))
+
+    def record_skip(self, target: str, reason: FallbackSkipReason) -> None:
+        self.skipped = (*self.skipped, SkippedFallbackTarget(target=target, reason=reason))
+
+
+def attempted_fallback_targets_from(kwargs: Mapping[str, object]) -> AttemptedFallbackTargets:
+    carried_targets: Final[object] = kwargs.get("attempted_targets")
+    return carried_targets if isinstance(carried_targets, AttemptedFallbackTargets) else AttemptedFallbackTargets()
 
 
 def has_unattempted_fallback_target(
@@ -607,6 +621,8 @@ async def _is_fallback_target_authorized(
     fallback_entry: str | Mapping[str, object],
     original_model_group: str,
     kwargs: Mapping[str, object],
+    *,
+    attempted: AttemptedFallbackTargets,
 ) -> bool:
     access_check: Final = litellm_router.fallback_access_check
     target: Final = _get_fallback_target_model_group(fallback_entry)
@@ -623,6 +639,7 @@ async def _is_fallback_target_authorized(
         "Skipping fallback to model_group = %s: caller is not authorized to call it",
         mask_sensitive_structure(fallback_entry),
     )
+    attempted.record_skip(target, FallbackSkipReason.NOT_AUTHORIZED)
     return False
 
 
@@ -631,6 +648,8 @@ async def _is_fallback_target_within_budget(
     fallback_entry: str | Mapping[str, object],
     original_model_group: str,
     kwargs: Mapping[str, object],
+    *,
+    attempted: AttemptedFallbackTargets,
 ) -> bool:
     budget_check: Final = litellm_router.fallback_budget_check
     target: Final = _get_fallback_target_model_group(fallback_entry)
@@ -642,6 +661,7 @@ async def _is_fallback_target_within_budget(
         "Skipping fallback to model_group = %s: caller is over budget",
         mask_sensitive_structure(fallback_entry),
     )
+    attempted.record_skip(target, FallbackSkipReason.OVER_BUDGET)
     return False
 
 
@@ -730,13 +750,7 @@ async def run_async_fallback(
     same_model_group_only: Final = references_provider_scoped_resource(kwargs) or creates_provider_scoped_resource(
         kwargs
     )
-    # Read out of kwargs and narrowed here rather than declared as a parameter: every caller
-    # reaches this function by spreading a loosely-typed kwargs dict, so a declared parameter
-    # would carry an annotation that no call site can actually be checked against.
-    carried_targets: Final = kwargs.get("attempted_targets")
-    attempted: Final = (
-        carried_targets if isinstance(carried_targets, AttemptedFallbackTargets) else AttemptedFallbackTargets()
-    )
+    attempted: Final = attempted_fallback_targets_from(kwargs)  # pyright: ignore[reportUnknownArgumentType]  # keep legacy kwargs untyped
     failed_model_group: Final = get_pre_routing_selection(kwargs) or original_model_group
     attempted.record(failed_model_group)
 
@@ -758,9 +772,13 @@ async def run_async_fallback(
                 original_model_group,
             )
             continue
-        if not await _is_fallback_target_authorized(litellm_router, mg, original_model_group, kwargs):
+        if not await _is_fallback_target_authorized(
+            litellm_router, mg, original_model_group, kwargs, attempted=attempted
+        ):
             continue
-        if not await _is_fallback_target_within_budget(litellm_router, mg, original_model_group, kwargs):
+        if not await _is_fallback_target_within_budget(
+            litellm_router, mg, original_model_group, kwargs, attempted=attempted
+        ):
             continue
         attempt_key = fallback_attempt_key(mg)
         if attempt_key is not None:
