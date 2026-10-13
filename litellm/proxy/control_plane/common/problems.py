@@ -39,6 +39,10 @@ def bad_gateway(detail: str) -> ProblemDetail:
     return problem("bad-gateway", "Bad Gateway", 502, detail)
 
 
+def service_unavailable(detail: str) -> ProblemDetail:
+    return problem("service-unavailable", "Service Unavailable", 503, detail)
+
+
 class ControlPlaneProblem(ManagementProblem):
     """A problem raised from a dependency or handler, rendered by the app-level handler below."""
 
