@@ -34,9 +34,9 @@ class RoutedTransport:  # mutable-ok: records calls for assertions
 
     routes: Mapping[str, Iterator[httpx.Response | Exception]]
     calls: list[tuple[str, dict[str, str] | None, dict[str, str] | None]] = field(default_factory=list)
+    writes: list[tuple[str, str, dict[str, object] | None]] = field(default_factory=list)
 
-    async def get(self, url: str, *, params=None, headers=None, timeout=None) -> httpx.Response:
-        self.calls.append((url, dict(params) if params else None, headers))
+    def _answer(self, url: str) -> httpx.Response:
         outcome = next(self.routes[url], None)
         if outcome is None:
             raise AssertionError(f"no scripted outcome left for {url}")
@@ -44,8 +44,29 @@ class RoutedTransport:  # mutable-ok: records calls for assertions
             raise outcome
         return outcome
 
+    async def get(self, url: str, *, params=None, headers=None, timeout=None) -> httpx.Response:
+        self.calls.append((url, dict(params) if params else None, headers))
+        return self._answer(url)
+
     async def post(self, url: str, *, json=None, headers=None, timeout=None) -> httpx.Response:
-        raise AssertionError("fleet reads never post")
+        self.calls.append((url, None, headers))
+        self.writes.append(("POST", url, json))
+        return self._answer(url)
+
+    async def put(self, url: str, *, json=None, params=None, headers=None, timeout=None) -> httpx.Response:
+        self.calls.append((url, dict(params) if params else None, headers))
+        self.writes.append(("PUT", url, json))
+        return self._answer(url)
+
+    async def patch(self, url: str, *, json=None, params=None, headers=None, timeout=None) -> httpx.Response:
+        self.calls.append((url, dict(params) if params else None, headers))
+        self.writes.append(("PATCH", url, json))
+        return self._answer(url)
+
+    async def delete(self, url: str, *, json=None, params=None, headers=None, timeout=None) -> httpx.Response:
+        self.calls.append((url, dict(params) if params else None, headers))
+        self.writes.append(("DELETE", url, json))
+        return self._answer(url)
 
 
 async def no_exchange(config: OAuthTokenExchangeConfig, subject_token: str) -> str:
@@ -68,8 +89,12 @@ class Minter:
         return {"Authorization": f"Bearer {self.codec.mint(principal)}"}
 
 
-def rig(routes: Mapping[str, list[httpx.Response | Exception]]) -> tuple[TestClient, RoutedTransport, Minter]:
-    settings = ControlPlaneSettings.model_validate({"LITELLM_MASTER_KEY": MASTER_KEY, "dataplanes": DATAPLANES})
+def rig(
+    routes: Mapping[str, list[httpx.Response | Exception]], **overrides: object
+) -> tuple[TestClient, RoutedTransport, Minter]:
+    settings = ControlPlaneSettings.model_validate(
+        {"LITELLM_MASTER_KEY": MASTER_KEY, "dataplanes": DATAPLANES, **overrides}
+    )
     queues: defaultdict[str, Iterator[httpx.Response | Exception]] = defaultdict(lambda: iter(()))
     queues.update({url: iter(outcomes) for url, outcomes in routes.items()})
     transport = RoutedTransport(queues)

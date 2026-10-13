@@ -12,7 +12,8 @@ from pydantic import TypeAdapter
 from litellm.proxy.control_plane.dataplanes.credentials import Caller, CredentialKind, CredentialUnavailable
 from litellm.proxy.control_plane.dataplanes.registry import Dataplane
 
-Method: TypeAlias = Literal["GET", "POST"]
+Method: TypeAlias = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+WRITE_METHODS: Final = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 Sleeper: TypeAlias = Callable[[float], Awaitable[None]]
 RETRYABLE_STATUSES: Final = frozenset({502, 503, 504})
 _JSON: Final = TypeAdapter(object)
@@ -36,6 +37,36 @@ class HttpTransport(Protocol):
         *,
         json: dict[str, object] | None = None,  # mutable-ok: AsyncHTTPHandler.post takes dict
         headers: dict[str, str] | None = None,  # mutable-ok: AsyncHTTPHandler.post takes dict
+        timeout: float | httpx.Timeout | None = None,
+    ) -> httpx.Response: ...
+
+    async def put(
+        self,
+        url: str,
+        *,
+        json: dict[str, object] | None = None,  # mutable-ok: AsyncHTTPHandler.put takes dict
+        params: dict[str, str] | None = None,  # mutable-ok: AsyncHTTPHandler.put takes dict
+        headers: dict[str, str] | None = None,  # mutable-ok: AsyncHTTPHandler.put takes dict
+        timeout: float | httpx.Timeout | None = None,
+    ) -> httpx.Response: ...
+
+    async def patch(
+        self,
+        url: str,
+        *,
+        json: dict[str, object] | None = None,  # mutable-ok: AsyncHTTPHandler.patch takes dict
+        params: dict[str, str] | None = None,  # mutable-ok: AsyncHTTPHandler.patch takes dict
+        headers: dict[str, str] | None = None,  # mutable-ok: AsyncHTTPHandler.patch takes dict
+        timeout: float | httpx.Timeout | None = None,
+    ) -> httpx.Response: ...
+
+    async def delete(
+        self,
+        url: str,
+        *,
+        json: dict[str, object] | None = None,  # mutable-ok: AsyncHTTPHandler.delete takes dict
+        params: dict[str, str] | None = None,  # mutable-ok: AsyncHTTPHandler.delete takes dict
+        headers: dict[str, str] | None = None,  # mutable-ok: AsyncHTTPHandler.delete takes dict
         timeout: float | httpx.Timeout | None = None,
     ) -> httpx.Response: ...
 
@@ -100,6 +131,18 @@ class DataplaneClient:
     async def post(self, dataplane: Dataplane, path: str, caller: Caller, json: Mapping[str, object]) -> CallResult:
         return await self._call("POST", dataplane, path, caller, params=None, json=json)
 
+    async def request(
+        self,
+        method: Method,
+        dataplane: Dataplane,
+        path: str,
+        caller: Caller,
+        params: Mapping[str, str] | None = None,
+        json: Mapping[str, object] | None = None,
+    ) -> CallResult:
+        """Any management verb. Only GET is retried, every write goes out exactly once."""
+        return await self._call(method, dataplane, path, caller, params=params, json=json)
+
     async def _call(
         self,
         method: Method,
@@ -149,23 +192,35 @@ class DataplaneClient:
         json: Mapping[str, object] | None,
     ) -> _RawReply | DataplaneUnreachable:
         try:
-            response: Final = (
-                await self.transport.get(
-                    url,
-                    params=None if params is None else dict(params),
-                    headers=dict(headers),
-                    timeout=self.timeout_seconds,
-                )
-                if method == "GET"
-                else await self.transport.post(
-                    url, json=None if json is None else dict(json), headers=dict(headers), timeout=self.timeout_seconds
-                )
-            )
+            response: Final = await self._dispatch(method, url, dict(headers), params, json)
         except httpx.HTTPStatusError as error:
             return _RawReply(error.response.status_code, _parse_body(error.response))
         except httpx.HTTPError as error:
             return DataplaneUnreachable(f"{type(error).__name__}: {error}", attempts=1)
         return _RawReply(response.status_code, _parse_body(response))
+
+    async def _dispatch(
+        self,
+        method: Method,
+        url: str,
+        headers: dict[str, str],  # mutable-ok: the transport takes dict
+        params: Mapping[str, str] | None,
+        json: Mapping[str, object] | None,
+    ) -> httpx.Response:
+        query: Final = None if params is None else dict(params)
+        body: Final = None if json is None else dict(json)
+        timeout: Final = self.timeout_seconds
+        match method:
+            case "GET":
+                return await self.transport.get(url, params=query, headers=headers, timeout=timeout)
+            case "POST":
+                return await self.transport.post(url, json=body, headers=headers, timeout=timeout)
+            case "PUT":
+                return await self.transport.put(url, json=body, params=query, headers=headers, timeout=timeout)
+            case "PATCH":
+                return await self.transport.patch(url, json=body, params=query, headers=headers, timeout=timeout)
+            case "DELETE":
+                return await self.transport.delete(url, json=body, params=query, headers=headers, timeout=timeout)
 
 
 def _retryable(outcome: _RawReply | DataplaneUnreachable) -> bool:
