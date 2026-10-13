@@ -309,13 +309,13 @@ where
                 self.streaming = true;
                 let head = Python::attach(|py| self.binding().encode_stream_head(py, head))?;
                 self.hooks().on_stream_open(&head)?;
-                self.consumed(Suspension::Open(head), reply).await;
+                self.consumed(Suspension::StreamOpen(head), reply).await;
                 Ok(())
             }
             HostRequest::Stream(StreamDelivery::Chunk(chunk, reply)) => {
                 let chunk = Python::attach(|py| self.binding().encode_chunk(py, chunk))?;
                 self.hooks().on_stream_chunk(&chunk)?;
-                self.consumed(Suspension::Yield(chunk), reply).await;
+                self.consumed(Suspension::StreamChunk(chunk), reply).await;
                 Ok(())
             }
         }
@@ -622,12 +622,12 @@ where
     }
     match driver.resume(None)? {
         ExecutionStep::Return(value) => Ok(value),
-        ExecutionStep::Suspended(Suspension::Open(head)) => {
+        ExecutionStep::Suspended(Suspension::StreamOpen(head)) => {
             Execution::suspended(driver, options.lifecycle)
                 .into_sync_stream(py, head)
                 .map(Bound::unbind)
         }
-        ExecutionStep::Suspended(Suspension::Await(_) | Suspension::Yield(_)) => {
+        ExecutionStep::Suspended(Suspension::Await(_) | Suspension::StreamChunk(_)) => {
             Err(PyRuntimeError::new_err("sync call suspended"))
         }
     }
