@@ -1,9 +1,11 @@
+import asyncio
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, cast
 
@@ -1765,10 +1767,9 @@ class MCPRequestHandler:
             # matters: the no_mcp_servers opt-out below reads the caller's own object_permission, so above
             # this branch a user's own opt-out would wrongly zero their TEAMS' grants too (each source is
             # independent; an opt-out silences only its own source, inside the recursive call).
-            if is_mcp_admitted_user_subject(user_api_key_auth) and user_api_key_auth is not None:
-                return MCPServerAccess(
-                    server_ids=tuple(await MCPRequestHandler.resolve_admitted_subject_servers(user_api_key_auth)),
-                )
+            multi_source_access: Final = await MCPRequestHandler._multi_source_server_access(user_api_key_auth)
+            if multi_source_access is not None:
+                return multi_source_access
 
             # Get allowed servers from key and team
             allowed_mcp_servers_for_key = await MCPRequestHandler._get_allowed_mcp_servers_for_key(user_api_key_auth)
@@ -2250,6 +2251,92 @@ class MCPRequestHandler:
         return await MCPRequestHandler._narrow_tools_to_toolset(sorted(allowed), server_id, auth)
 
     @staticmethod
+    async def _multi_source_server_access(user_api_key_auth: UserAPIKeyAuth | None) -> MCPServerAccess | None:
+        """Server access for the two caller shapes pinned to no single team, each resolved per grant
+        source: a keyless admitted subject (its own grants plus its teams') and, under
+        ``personal_key_model_access_from_teams``, a personal key (its owner's teams). None for every
+        other caller, which the single-source rules then resolve."""
+        from litellm.proxy.auth.auth_checks import personal_key_team_model_access_applies
+
+        if user_api_key_auth is None:
+            return None
+        if is_mcp_admitted_user_subject(user_api_key_auth):
+            return MCPServerAccess(
+                server_ids=tuple(await MCPRequestHandler.resolve_admitted_subject_servers(user_api_key_auth)),
+            )
+        if personal_key_team_model_access_applies(user_api_key_auth):
+            return await MCPRequestHandler.resolve_personal_key_team_servers(user_api_key_auth)
+        return None
+
+    @staticmethod
+    async def personal_key_team_sources(auth: UserAPIKeyAuth) -> tuple[UserAPIKeyAuth, ...]:
+        """One source per current team of a personal key's owner, each resolving as the same key pinned
+        to that team, so key/team inheritance and intersection hold exactly as for a team key. The
+        pinned ``team_id`` keeps a source out of this branch. No team, or an owner that cannot be
+        loaded, yields no source: the key reaches nothing through its owner."""
+        from litellm.proxy.auth.auth_checks import personal_key_owner_teams
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+
+        teams: Final = await personal_key_owner_teams(
+            valid_token=auth,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        return tuple(
+            auth.model_copy(
+                update=MappingProxyType({"team_id": team.team_id, "org_id": team.organization_id or auth.org_id})
+            )
+            for team in teams
+        )
+
+    @staticmethod
+    async def personal_key_team_server_grants(
+        auth: UserAPIKeyAuth,
+    ) -> tuple[tuple[UserAPIKeyAuth, MCPServerAccess], ...]:
+        sources: Final = await MCPRequestHandler.personal_key_team_sources(auth)
+        accesses: Final = await asyncio.gather(*(MCPRequestHandler.get_mcp_server_access(source) for source in sources))
+        return tuple(zip(sources, accesses, strict=True))
+
+    @staticmethod
+    async def resolve_personal_key_team_servers(auth: UserAPIKeyAuth) -> MCPServerAccess:
+        """Union of what the owner's teams grant the personal key, each answered by the canonical
+        resolver. Unscoped only when some team leaves the key unscoped, as a team key of it would be."""
+        grants: Final = await MCPRequestHandler.personal_key_team_server_grants(auth)
+        server_ids: Final = tuple(dict.fromkeys(chain.from_iterable(access.server_ids for _source, access in grants)))
+        unscoped: Final = any(access.scope == "unscoped" for _source, access in grants)
+        return MCPServerAccess(server_ids=server_ids, scope="unscoped" if unscoped else "scoped")
+
+    @staticmethod
+    async def resolve_personal_key_team_tools(server_id: str, auth: UserAPIKeyAuth) -> tuple[str, ...] | None:
+        """Effective tool allowlist on ``server_id`` for a personal key: the union over the owner's teams
+        that grant the server, or over all of them when the server is reached through an open channel
+        (allow_all_keys, BYOM) that no team names. A granting team without a tool rule allows every tool;
+        no granting team denies all."""
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+
+        grants: Final = await MCPRequestHandler.personal_key_team_server_grants(auth)
+        granting: Final = tuple(source for source, access in grants if server_id in access.server_ids)
+        open_channel: Final = not granting and server_id in await global_mcp_server_manager.operator_open_server_ids(
+            auth
+        )
+        sources: Final = tuple(source for source, _access in grants) if open_channel else granting
+        if not sources:
+            return ()
+        tool_lists: Final = await asyncio.gather(
+            *(MCPRequestHandler.get_allowed_tools_for_server(server_id, source) for source in sources)
+        )
+        if any(tools is None for tools in tool_lists):
+            return None
+        return tuple(sorted(frozenset(chain.from_iterable(tools for tools in tool_lists if tools is not None))))
+
+    @staticmethod
     def _get_key_object_permission(
         user_api_key_auth: UserAPIKeyAuth | None = None,
     ):
@@ -2453,12 +2540,17 @@ class MCPRequestHandler:
 
             return await managed_agent_tools(server_id, user_api_key_auth)
 
+        from litellm.proxy.auth.auth_checks import personal_key_team_model_access_applies
+
         try:
             # FIRST statement, mirroring get_allowed_mcp_servers: a keyless admitted subject resolves per
             # source and shares nothing with the single-credential prelude below. Ordering is the invariant:
             # sat after the prelude, a fault in a lookup the subject never uses denied tools its teams grant.
             if is_mcp_admitted_user_subject(user_api_key_auth):
                 return await MCPRequestHandler.resolve_admitted_subject_tools(server_id, user_api_key_auth)
+
+            if personal_key_team_model_access_applies(user_api_key_auth):
+                return _as_list(await MCPRequestHandler.resolve_personal_key_team_tools(server_id, user_api_key_auth))
 
             # Get key and team object permissions (already loaded in main auth flow)
             key_obj_perm: Final = MCPRequestHandler._get_key_object_permission(user_api_key_auth)

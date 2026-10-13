@@ -5901,6 +5901,23 @@ async def _personal_key_listing_teams(
     )
 
 
+async def personal_key_owner_teams(
+    valid_token: UserAPIKeyAuth,
+    prisma_client: PrismaClient | None,
+    user_api_key_cache: UserApiKeyCache | None,
+    proxy_logging_obj: ProxyLogging | None,
+) -> tuple[LiteLLM_TeamTableCachedObj, ...]:
+    """The owner's current, loadable, unblocked teams: the grant sources a personal key inherits
+    MCP server, MCP tool and agent access from under ``personal_key_model_access_from_teams``."""
+    teams: Final = await _personal_key_listing_teams(
+        user_api_key_dict=valid_token,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+    return tuple(team for team in teams if team is not None)
+
+
 async def personal_key_team_visible_models(
     models: Sequence[str],
     user_api_key_dict: UserAPIKeyAuth,

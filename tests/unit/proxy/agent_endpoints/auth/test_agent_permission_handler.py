@@ -1159,3 +1159,77 @@ async def test_target_authorization_uses_live_policy_despite_stale_unmanaged_reg
         assert denied.value.status_code == 503
         return
     assert await AgentRequestHandler.is_agent_allowed("target", auth) is allowed
+
+
+_PERSONAL_KEY_TEAM_AGENTS: Final = {"team-a": ("agent-a",), "team-b": ("agent-b",), "team-open": ()}
+
+
+@pytest.fixture
+def personal_key_owner_teams(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> UserAPIKeyAuth:
+    """A personal key whose owner is on ``request.param`` teams; team-a grants agent-a, team-b grants
+    agent-b and team-open grants no agent rule at all."""
+    from unittest.mock import MagicMock
+
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_TeamTable, LiteLLM_UserTable
+    from litellm.proxy.auth import auth_checks
+
+    async def _get_team_object(team_id: str, **_: object) -> LiteLLM_TeamTable:
+        team: Final = LiteLLM_TeamTable(team_id=team_id, object_permission_id=f"perm-{team_id}")
+        team.object_permission = LiteLLM_ObjectPermissionTable(
+            object_permission_id=f"perm-{team_id}", agents=list(_PERSONAL_KEY_TEAM_AGENTS[team_id])
+        )
+        return team
+
+    monkeypatch.setattr(litellm, "personal_key_model_access_from_teams", True)
+    monkeypatch.setattr(proxy_server, "prisma_client", MagicMock())
+    monkeypatch.setattr(proxy_server, "user_api_key_cache", MagicMock())
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", MagicMock())
+    monkeypatch.setattr(auth_checks, "get_team_object", _get_team_object)
+    monkeypatch.setattr(
+        auth_checks,
+        "get_user_object",
+        AsyncMock(return_value=LiteLLM_UserTable(user_id="alice", teams=list(request.param))),
+    )
+    return UserAPIKeyAuth(api_key="sk-personal", user_id="alice", team_id=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "personal_key_owner_teams, expected",
+    [
+        (("team-a", "team-b"), RestrictedAgentAccess(frozenset({"agent-a", "agent-b"}))),
+        (("team-b",), RestrictedAgentAccess(frozenset({"agent-b"}))),
+        ((), RestrictedAgentAccess(frozenset())),
+        (("team-a", "team-open"), UnrestrictedAgentAccess()),
+    ],
+    indirect=["personal_key_owner_teams"],
+)
+async def test_personal_key_agents_are_the_union_of_its_owner_team_grants(
+    personal_key_owner_teams: UserAPIKeyAuth, expected: AgentAccess
+) -> None:
+    assert await AgentRequestHandler.resolve_key_team_agent_access(personal_key_owner_teams) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("personal_key_owner_teams", [("team-a",)], indirect=True)
+async def test_personal_key_agent_access_is_unchanged_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch, personal_key_owner_teams: UserAPIKeyAuth
+) -> None:
+    import litellm
+
+    monkeypatch.setattr(litellm, "personal_key_model_access_from_teams", False)
+    assert await AgentRequestHandler.resolve_key_team_agent_access(personal_key_owner_teams) == UnrestrictedAgentAccess()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("personal_key_owner_teams", [("team-a", "team-b")], indirect=True)
+async def test_team_key_agent_access_ignores_its_owner_other_teams(personal_key_owner_teams: UserAPIKeyAuth) -> None:
+    from litellm.proxy.auth import auth_checks
+
+    team_key: Final = personal_key_owner_teams.model_copy(update={"team_id": "team-b"})
+    assert await AgentRequestHandler.resolve_key_team_agent_access(team_key) == RestrictedAgentAccess(
+        frozenset({"agent-b"})
+    )
+    auth_checks.get_user_object.assert_not_awaited()

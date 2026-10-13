@@ -8,6 +8,7 @@ Follows the same pattern as MCP permission handling.
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from itertools import chain
 from types import MappingProxyType
 from typing import Final, TypeAlias
 
@@ -57,6 +58,16 @@ def _restricted_ids(access: AgentAccess) -> frozenset[str] | None:
     if isinstance(access, UnrestrictedAgentAccess):
         return None
     return _to_stable_ids(access.agent_ids)
+
+
+def _union_agent_access(accesses: Sequence[AgentAccess]) -> AgentAccess:
+    if any(isinstance(access, UnrestrictedAgentAccess) for access in accesses):
+        return UnrestrictedAgentAccess()
+    return RestrictedAgentAccess(
+        frozenset(
+            chain.from_iterable(access.agent_ids for access in accesses if isinstance(access, RestrictedAgentAccess))
+        )
+    )
 
 
 def _intersect_agent_access(key_access: AgentAccess, team_access: AgentAccess) -> AgentAccess:
@@ -334,6 +345,35 @@ class AgentRequestHandler:
             return UnrestrictedAgentAccess()
 
     @staticmethod
+    async def _personal_key_owner_team_agent_access(user_api_key_auth: UserAPIKeyAuth, *, strict: bool) -> AgentAccess:
+        """Union over the owner's current teams, each resolved as this key pinned to that team. An owner
+        in no team, or one that cannot be loaded, reaches no agent."""
+        from litellm.proxy.auth.auth_checks import personal_key_owner_teams
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+
+        teams: Final = await personal_key_owner_teams(
+            valid_token=user_api_key_auth,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        return _union_agent_access(
+            await asyncio.gather(
+                *(
+                    AgentRequestHandler._get_allowed_agents_for_team(
+                        user_api_key_auth.model_copy(update=MappingProxyType({"team_id": team.team_id})),
+                        strict=strict,
+                    )
+                    for team in teams
+                )
+            )
+        )
+
+    @staticmethod
     async def _get_allowed_agents_for_team(
         user_api_key_auth: UserAPIKeyAuth | None = None,
         *,
@@ -352,7 +392,11 @@ class AgentRequestHandler:
             return UnrestrictedAgentAccess()
 
         if user_api_key_auth.team_id is None:
-            return UnrestrictedAgentAccess()
+            from litellm.proxy.auth.auth_checks import personal_key_team_model_access_applies
+
+            if not personal_key_team_model_access_applies(user_api_key_auth):
+                return UnrestrictedAgentAccess()
+            return await AgentRequestHandler._personal_key_owner_team_agent_access(user_api_key_auth, strict=strict)
 
         try:
             from litellm.proxy.auth.auth_checks import get_team_object
