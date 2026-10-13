@@ -117,6 +117,15 @@ from litellm.proxy.auth.auth_utils import (
     route_in_additonal_public_routes,
 )
 from litellm.proxy.auth.handle_jwt import JWTAuthManager, JWTHandler
+from litellm.proxy.auth.impersonation import (
+    IMPERSONATE_USER_HEADER,
+    ImpersonatedUserNotFound,
+    ImpersonationForbidden,
+    ImpersonationRequest,
+    actor_label,
+    impersonate,
+    read_impersonation_request,
+)
 from litellm.proxy.auth.network import TrustedProxyConfig, resolve_network_context
 from litellm.proxy.auth.oauth2_check import Oauth2Handler
 from litellm.proxy.auth.oauth2_proxy_hook import handle_oauth2_proxy_request
@@ -185,6 +194,7 @@ from litellm.router_utils.fallback_event_handlers import (
     get_fallback_model_group_for_lookup_groups,
 )
 from litellm.secret_managers.main import get_secret_bool
+from litellm.types.proxy.auth.auth_checks import UserNotFoundError
 from litellm.types.services import ServiceTypes
 
 try:
@@ -3210,7 +3220,61 @@ async def validate_resolved_virtual_key(  # noqa: C901  # Preserve ordering of e
             start_time=start_time,
         )
         virtual_key_auth_obj.via_virtual_key = True
-        return virtual_key_auth_obj
+        impersonation: Final = read_impersonation_request(request.headers)
+        if impersonation is None:
+            return virtual_key_auth_obj
+        return await _impersonate_or_raise(
+            actor=virtual_key_auth_obj,
+            impersonation=impersonation,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            parent_otel_span=parent_otel_span,
+            proxy_logging_obj=proxy_logging_obj,
+            route=route,
+        )
+
+
+async def _impersonate_or_raise(
+    actor: UserAPIKeyAuth,
+    impersonation: ImpersonationRequest,
+    prisma_client: PrismaClient | None,
+    user_api_key_cache: UserApiKeyCache,
+    parent_otel_span: Span | None,
+    proxy_logging_obj: ProxyLogging,
+    route: str,
+) -> UserAPIKeyAuth:
+    async def lookup(user_id: str, user_email: str | None) -> LiteLLM_UserTable | None:
+        try:
+            return await get_user_object(
+                user_id=user_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                user_id_upsert=False,
+                parent_otel_span=parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+                user_email=user_email,
+            )
+        except UserNotFoundError:
+            return None
+
+    result: Final = await impersonate(actor, impersonation, lookup)
+    match result:
+        case UserAPIKeyAuth():
+            verbose_proxy_logger.info(
+                "impersonation: actor=%s subject=%s route=%s", actor_label(actor), result.user_id, route
+            )
+            return result
+        case ImpersonationForbidden(detail=detail):
+            raise ProxyException(
+                message=detail, type=ProxyErrorTypes.auth_error, param=IMPERSONATE_USER_HEADER, code=403
+            )
+        case ImpersonatedUserNotFound(user_id=user_id):
+            raise ProxyException(
+                message=f"impersonated user {user_id!r} does not exist on this proxy",
+                type=ProxyErrorTypes.auth_error,
+                param=IMPERSONATE_USER_HEADER,
+                code=401,
+            )
 
 
 async def _safe_fetch(label: str, awaitable):

@@ -6,6 +6,7 @@ from datetime import timedelta
 from types import MappingProxyType
 from typing import Final
 
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy.control_plane.auth.jwt import JwksKeyLookup, SessionTokenCodec, TokenVerifier, build_token_verifier
 from litellm.proxy.control_plane.auth.login import LoginService
 from litellm.proxy.control_plane.auth.rbac import (
@@ -17,6 +18,9 @@ from litellm.proxy.control_plane.auth.rbac import (
     build_policy,
     parse_role_definition,
 )
+from litellm.proxy.control_plane.dataplanes.client import DataplaneClient, HttpTransport, RetryPolicy
+from litellm.proxy.control_plane.dataplanes.credentials import TokenExchanger, http_token_exchanger
+from litellm.proxy.control_plane.dataplanes.registry import DataplaneRegistry, build_registry
 from litellm.proxy.control_plane.settings import ControlPlaneSettings
 
 
@@ -26,6 +30,8 @@ class Container:
     policy: RolePolicy
     token_verifier: TokenVerifier
     login_service: LoginService
+    registry: DataplaneRegistry
+    dataplane_client: DataplaneClient
 
 
 class InvalidRolePolicy(ValueError):
@@ -56,9 +62,22 @@ def build_role_policy(settings: ControlPlaneSettings) -> RolePolicy:
     raise InvalidRolePolicy(policy)
 
 
-def build_container(settings: ControlPlaneSettings, jwks: JwksKeyLookup | None = None) -> Container:
+def build_container(
+    settings: ControlPlaneSettings,
+    jwks: JwksKeyLookup | None = None,
+    transport: HttpTransport | None = None,
+    exchanger: TokenExchanger | None = None,
+) -> Container:
     master_key: Final = settings.master_key.get_secret_value()
     policy: Final = build_role_policy(settings)
+    http: Final = transport if transport is not None else AsyncHTTPHandler(timeout=settings.dataplane_timeout_seconds)
+    exchange: Final = (
+        exchanger
+        if exchanger is not None
+        else http_token_exchanger(
+            AsyncHTTPHandler(timeout=settings.dataplane_timeout_seconds), settings.dataplane_timeout_seconds
+        )
+    )
     sessions: Final = SessionTokenCodec(
         master_key=master_key,
         issuer=settings.session_issuer,
@@ -76,5 +95,11 @@ def build_container(settings: ControlPlaneSettings, jwks: JwksKeyLookup | None =
             ttl_seconds=settings.session_ttl_seconds,
             admin_username=settings.ui_username,
             admin_password=None if password is None else password.get_secret_value(),
+        ),
+        registry=build_registry(settings.dataplanes, exchange),
+        dataplane_client=DataplaneClient(
+            transport=http,
+            timeout_seconds=settings.dataplane_timeout_seconds,
+            retry=RetryPolicy(attempts=settings.dataplane_retry_attempts),
         ),
     )

@@ -35,6 +35,10 @@ def not_found(detail: str) -> ProblemDetail:
     return problem("not-found", "Not Found", 404, detail)
 
 
+def bad_gateway(detail: str) -> ProblemDetail:
+    return problem("bad-gateway", "Bad Gateway", 502, detail)
+
+
 class ControlPlaneProblem(ManagementProblem):
     """A problem raised from a dependency or handler, rendered by the app-level handler below."""
 
